@@ -6,14 +6,13 @@
  * Runtime: Bun (bun:sqlite, Bun.serve, Bun.spawn, native crypto, native fetch)
  *
  * Usage:
- *   GITHUB_TOKEN=ghp_xxx GITHUB_WEBHOOK_SECRET=xxx bun run bridge.ts
+ *   GITHUB_TOKEN=ghp_xxx GITHUB_WEBHOOK_SECRET=xxx bun run index.ts
  *
  * Environment variables:
  *   GITHUB_TOKEN            - GitHub PAT with `repo` scope (for comment writeback)
  *   GITHUB_WEBHOOK_SECRET   - Shared secret configured in GitHub org webhook
  *   BRIDGE_PORT             - (optional) HTTP port, default 3847
  *   BRIDGE_DB_PATH          - (optional) SQLite file path, default ./data/bridge.sqlite
- *   BRIDGE_WEBHOOK_PATH     - (optional) Webhook endpoint path, default /webhook/github
  *   BOT_USERNAME            - (optional) GitHub bot username, default R2D2-im
  *   OPENCLAW_BIN            - (optional) openclaw binary path, default openclaw
  *   OPENCLAW_AGENT_ID       - (optional) agent name, default swe
@@ -34,7 +33,7 @@ import { dirname } from "path";
 const config = {
   port: parseInt(process.env.BRIDGE_PORT || "3847", 10),
   dbPath: process.env.BRIDGE_DB_PATH || "./data/bridge.sqlite",
-  webhookPath: process.env.BRIDGE_WEBHOOK_PATH || "/webhook/github",
+  webhookPath: "/hooks",
   maxBodyBytes: 1_048_576, // 1 MB
 
   githubToken: process.env.GITHUB_TOKEN || "",
@@ -138,6 +137,26 @@ interface Task {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+}
+
+interface AckContext {
+  commentExcerpt: string | null;
+}
+
+interface TaskExecutionSuccess {
+  kind: "completed";
+  exitCode: number;
+  stdout: string;
+  prUrl: string | null;
+}
+
+interface TaskExecutionFailure {
+  kind: "failed";
+  reason: "non_zero_exit" | "timeout" | "binary_not_found" | "spawn_error";
+  exitCode: number | null;
+  errorMessage: string;
+  stdout: string | null;
+  stderr: string | null;
 }
 
 // ─────────────────────────────────────────────
@@ -258,6 +277,30 @@ function getQueuePosition(db: Database, taskId: number): number {
   return row.pos;
 }
 
+function buildCommentExcerpt(text: string | null | undefined): string | null {
+  if (!text) return null;
+
+  const excerpt = text
+    .split("\n")
+    .map(line => line.trimEnd())
+    .filter(line => line.trim().length > 0)
+    .slice(0, 3)
+    .map(line => line.slice(0, 120))
+    .join("\n");
+
+  return excerpt || null;
+}
+
+function extractAckContext(event: WebhookEvent, payload: any): AckContext {
+  if (event.triggerType !== "mention") {
+    return { commentExcerpt: null };
+  }
+
+  return {
+    commentExcerpt: buildCommentExcerpt(payload.comment?.body),
+  };
+}
+
 // ─────────────────────────────────────────────
 // GitHub Writer
 // ─────────────────────────────────────────────
@@ -288,12 +331,17 @@ async function githubComment(repoFull: string, issueNumber: number, body: string
   log("error", `Failed to write GitHub comment after 3 attempts: ${repoFull}#${issueNumber}`);
 }
 
-async function writeAck(task: Task, queuePos: number): Promise<void> {
+async function writeAck(task: Task, queuePos: number, ack: AckContext): Promise<void> {
   const body = [
     `🤖 Task received. Queued at position #${queuePos}.`,
     `Trigger: ${task.trigger_type} by @${task.triggered_by}`,
-  ].join("\n");
-  await githubComment(task.repo_full, task.resource_number, body);
+  ];
+
+  if (ack.commentExcerpt) {
+    body.push("", "Context:", `> ${ack.commentExcerpt.replace(/\n/g, "\n> ")}`);
+  }
+
+  await githubComment(task.repo_full, task.resource_number, body.join("\n"));
 }
 
 async function writeStarted(task: Task): Promise<void> {
@@ -354,17 +402,22 @@ function buildPrompt(task: Task): string {
 // OpenClaw CLI Invocation
 // ─────────────────────────────────────────────
 
-async function callOpenClaw(task: Task): Promise<{ exitCode: number; stdout: string; prUrl: string | null }> {
+async function callOpenClaw(task: Task): Promise<TaskExecutionSuccess> {
   const prompt = buildPrompt(task);
 
-  const proc = Bun.spawn(
-    [config.openclawBin, "agent", "--agent", config.openclawAgentId, "--message", prompt],
-    {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, HOME: config.openclawHome },
-    },
-  );
+  let proc;
+  try {
+    proc = Bun.spawn(
+      [config.openclawBin, "agent", "--agent", config.openclawAgentId, "--message", prompt],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, HOME: config.openclawHome },
+      },
+    );
+  } catch (err: any) {
+    throw buildSpawnFailure(err);
+  }
 
   let killed = false;
   const timeout = setTimeout(() => {
@@ -380,27 +433,72 @@ async function callOpenClaw(task: Task): Promise<{ exitCode: number; stdout: str
 
   const stdout = await new Response(proc.stdout).text();
   const stderr = await new Response(proc.stderr).text();
+  const truncatedStdout = truncateText(stdout, config.maxStdoutBytes);
+  const truncatedStderr = truncateText(stderr, 4000);
 
   if (killed) {
-    throw new Error(`Task timed out after ${config.taskTimeoutMs / 60000} minutes`);
+    throw {
+      kind: "failed",
+      reason: "timeout",
+      exitCode: exitCode ?? null,
+      errorMessage: `Task timed out after ${config.taskTimeoutMs / 60000} minutes`,
+      stdout: truncatedStdout || null,
+      stderr: truncatedStderr || null,
+    } satisfies TaskExecutionFailure;
   }
 
   if (exitCode !== 0) {
-    throw new Error(`openclaw agent exited with code ${exitCode}: ${(stderr || stdout).slice(0, 2000)}`);
+    const reason = inferFailureReason(exitCode, stderr || stdout);
+    const detail = truncateText(stderr || stdout, 2000) || "Process exited without output";
+    throw {
+      kind: "failed",
+      reason,
+      exitCode,
+      errorMessage: `openclaw agent exited with code ${exitCode}: ${detail}`,
+      stdout: truncatedStdout || null,
+      stderr: truncatedStderr || null,
+    } satisfies TaskExecutionFailure;
   }
 
   const prUrl = extractPrUrl(stdout);
-  // Truncate stdout for DB storage
-  const truncated = stdout.length > config.maxStdoutBytes
-    ? stdout.slice(-config.maxStdoutBytes)
-    : stdout;
-
-  return { exitCode, stdout: truncated, prUrl };
+  return { kind: "completed", exitCode, stdout: truncatedStdout, prUrl };
 }
 
 function extractPrUrl(text: string): string | null {
   const match = text.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
   return match ? match[0] : null;
+}
+
+function truncateText(text: string, maxBytes: number): string {
+  if (text.length <= maxBytes) return text;
+  return text.slice(-maxBytes);
+}
+
+function inferFailureReason(exitCode: number, output: string): TaskExecutionFailure["reason"] {
+  const normalized = output.toLowerCase();
+  if (exitCode === 127 || normalized.includes("enoent") || normalized.includes("not found")) {
+    return "binary_not_found";
+  }
+  return "non_zero_exit";
+}
+
+function buildSpawnFailure(err: any): TaskExecutionFailure {
+  const raw = String(err?.message || err || "Unknown spawn error");
+  const normalized = raw.toLowerCase();
+  const reason = normalized.includes("enoent") || normalized.includes("not found")
+    ? "binary_not_found"
+    : "spawn_error";
+
+  return {
+    kind: "failed",
+    reason,
+    exitCode: null,
+    errorMessage: reason === "binary_not_found"
+      ? `openclaw binary not found: ${raw}`
+      : `failed to start openclaw agent: ${raw}`,
+    stdout: null,
+    stderr: null,
+  };
 }
 
 // ─────────────────────────────────────────────
@@ -476,17 +574,44 @@ async function schedulerLoop(db: Database): Promise<void> {
       await writeCompleted(task, result.prUrl, result.stdout);
       log("info", `Task #${task.id} completed${result.prUrl ? ` — PR: ${result.prUrl}` : ""}`);
     } catch (err: any) {
+      const failure = normalizeTaskFailure(err);
       db.prepare(
-        "UPDATE tasks SET status = 'failed', error_message = ?, finished_at = datetime('now') WHERE id = ?",
-      ).run(err.message?.slice(0, 5000) || "Unknown error", task.id);
+        "UPDATE tasks SET status = 'failed', exit_code = ?, stdout = ?, error_message = ?, finished_at = datetime('now') WHERE id = ?",
+      ).run(
+        failure.exitCode,
+        failure.stdout,
+        failure.errorMessage.slice(0, 5000),
+        task.id,
+      );
 
       db.prepare(`INSERT INTO event_log (task_id, event_type, payload) VALUES (?, ?, ?)`)
-        .run(task.id, "failed", JSON.stringify({ error: err.message }));
+        .run(task.id, "failed", JSON.stringify({
+          reason: failure.reason,
+          exit_code: failure.exitCode,
+          error: failure.errorMessage,
+          stderr: failure.stderr,
+        }));
 
-      await writeFailed(task, task.exit_code, err.message || "Unknown error");
-      log("error", `Task #${task.id} failed: ${err.message}`);
+      await writeFailed(task, failure.exitCode, failure.errorMessage);
+      log("error", `Task #${task.id} failed (${failure.reason}): ${failure.errorMessage}`);
     }
   }
+}
+
+function normalizeTaskFailure(err: unknown): TaskExecutionFailure {
+  if (err && typeof err === "object" && "kind" in err && (err as TaskExecutionFailure).kind === "failed") {
+    return err as TaskExecutionFailure;
+  }
+
+  const errorMessage = err instanceof Error ? err.message : String(err || "Unknown error");
+  return {
+    kind: "failed",
+    reason: "spawn_error",
+    exitCode: null,
+    errorMessage,
+    stdout: null,
+    stderr: null,
+  };
 }
 
 // ─────────────────────────────────────────────
@@ -564,7 +689,11 @@ async function refresh() {
       const res = t.resource_type === 'pull_request' ? 'PR' : 'Issue';
       const link = 'https://github.com/' + t.repo_full + '/' + (t.resource_type === 'pull_request' ? 'pull' : 'issues') + '/' + t.resource_number;
       const pr = t.result_pr_url ? '<a href="' + esc(t.result_pr_url) + '" target="_blank">View</a>' : '-';
-      const details = t.stdout ? '<span class="expand" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\\'block\\'?\\'none\\':\\'block\\'">stdout</span><div class="stdout-box">' + esc(t.stdout) + '</div>' : (t.error_message ? '<span title="' + esc(t.error_message) + '">⚠️</span>' : '-');
+      const skipped = t.skip_reason ? '<span title="' + esc(t.skip_reason) + '">skipped: ' + esc(t.skip_reason) + '</span>' : '';
+      const failed = t.error_message ? '<span title="' + esc(t.error_message) + '">⚠️' + (t.exit_code !== null && t.exit_code !== undefined ? ' exit ' + t.exit_code : '') + '</span>' : '';
+      const stdout = t.stdout ? '<span class="expand" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\\'block\\'?\\'none\\':\\'block\\'">stdout</span><div class="stdout-box">' + esc(t.stdout) + '</div>' : '';
+      const detailParts = [skipped, failed, stdout].filter(Boolean);
+      const details = detailParts.length ? detailParts.join('<br>') : '-';
       return '<tr>' +
         '<td>' + t.id + '</td>' +
         '<td><a href="' + link + '" target="_blank">' + esc(t.repo_full) + '#' + t.resource_number + '</a></td>' +
@@ -617,7 +746,18 @@ function startServer(db: Database): void {
       if (req.method === "GET" && path === "/api/tasks") {
         const limit = parseInt(url.searchParams.get("limit") || "100", 10);
         const tasks = db.prepare(
-          "SELECT * FROM tasks ORDER BY id DESC LIMIT ?",
+          `SELECT
+             tasks.*,
+             (
+               SELECT json_extract(event_log.payload, '$.reason')
+               FROM event_log
+               WHERE event_log.task_id = tasks.id AND event_log.event_type = 'skipped'
+               ORDER BY event_log.id DESC
+               LIMIT 1
+             ) AS skip_reason
+           FROM tasks
+           ORDER BY id DESC
+           LIMIT ?`,
         ).all(limit);
         return Response.json({ tasks, count: tasks.length });
       }
@@ -701,6 +841,8 @@ async function handleWebhook(req: Request, db: Database): Promise<Response> {
     return new Response("OK (filtered)", { status: 200 });
   }
 
+  const ack = extractAckContext(event, payload);
+
   // Enqueue
   const result = enqueue(db, event);
   if (result.status === "duplicate") {
@@ -714,7 +856,7 @@ async function handleWebhook(req: Request, db: Database): Promise<Response> {
   const taskId = result.taskId!;
   const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as Task;
   const pos = getQueuePosition(db, taskId);
-  writeAck(task, pos).catch(err => log("error", `Failed to write ack: ${err.message}`));
+  writeAck(task, pos, ack).catch(err => log("error", `Failed to write ack: ${err.message}`));
 
   return new Response("Accepted", { status: 202 });
 }
