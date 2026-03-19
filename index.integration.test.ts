@@ -32,10 +32,16 @@ interface GitHubCommentRecord {
   body: string;
 }
 
+interface GitHubReactionRecord {
+  path: string;
+  content: string;
+}
+
 interface StartedProcess {
   config: TestConfig;
   configPath: string;
   githubComments: GitHubCommentRecord[];
+  githubReactions: GitHubReactionRecord[];
   workdir: string;
   stop: () => Promise<void>;
 }
@@ -52,7 +58,7 @@ afterEach(async () => {
 });
 
 describe("bridge integration", () => {
-  test("loads JSON config and writes mention ack with quoted excerpt", async () => {
+  test("loads JSON config and marks mention comment with reaction instead of received comment", async () => {
     const bridge = await startBridge({
       openclawBin: "/usr/bin/true",
       pollIntervalMs: 250,
@@ -76,17 +82,12 @@ describe("bridge integration", () => {
     const task = await waitForTask(bridge.config.port, taskItem => taskItem.resource_number === 101 && taskItem.status === "completed");
     expect(task.trigger_type).toBe("mention");
 
-    await waitFor(() => bridge.githubComments.filter(comment => comment.issueNumber === 101).length >= 3, "mention comments");
-    const ack = bridge.githubComments.find(comment =>
-      comment.issueNumber === 101 && comment.body.includes("Task received."),
-    );
-
-    expect(ack).toBeDefined();
-    expect(ack?.body).toContain("Context:");
-    expect(ack?.body).toContain("> @R2D2-im please take this");
-    expect(ack?.body).toContain("> second line");
-    expect(ack?.body).toContain("> third line");
-    expect(ack?.body).not.toContain("fourth line");
+    await waitFor(() => bridge.githubReactions.some(reaction => reaction.path.endsWith("/issues/comments/5001/reactions")), "mention reaction");
+    expect(bridge.githubReactions).toContainEqual({
+      path: "/repos/acme/widgets/issues/comments/5001/reactions",
+      content: "eyes",
+    });
+    expect(bridge.githubComments.some(comment => comment.issueNumber === 101 && comment.body.includes("Task received."))).toBe(false);
   });
 
   test("records failed exit code and writes failed comment with exit code", async () => {
@@ -111,7 +112,12 @@ describe("bridge integration", () => {
     expect(task.exit_code).toBe(1);
     expect(String(task.error_message)).toContain("exited with code 1");
 
-    await waitFor(() => bridge.githubComments.filter(comment => comment.issueNumber === 102).length >= 3, "failed comments");
+    await waitFor(() => bridge.githubReactions.some(reaction => reaction.path.endsWith("/issues/102/reactions")), "assignment reaction");
+    expect(bridge.githubReactions).toContainEqual({
+      path: "/repos/acme/widgets/issues/102/reactions",
+      content: "eyes",
+    });
+    await waitFor(() => bridge.githubComments.filter(comment => comment.issueNumber === 102).length >= 2, "failed comments");
     const failedComment = bridge.githubComments.find(comment =>
       comment.issueNumber === 102 && comment.body.includes("Task failed"),
     );
@@ -209,17 +215,34 @@ async function startBridge(overrides: Partial<TestConfig>): Promise<StartedProce
   const githubPort = await getFreePort();
   const bridgePort = await getFreePort();
   const githubComments: GitHubCommentRecord[] = [];
+  const githubReactions: GitHubReactionRecord[] = [];
   const githubServer = Bun.serve({
     port: githubPort,
     fetch: async request => {
-      const body = await request.json() as { body?: string };
-      const match = new URL(request.url).pathname.match(/\/issues\/(\d+)\/comments$/);
-      githubComments.push({
-        path: new URL(request.url).pathname,
-        issueNumber: match ? Number(match[1]) : -1,
-        body: body.body || "",
-      });
-      return Response.json({ id: githubComments.length }, { status: 201 });
+      const path = new URL(request.url).pathname;
+      const body = await request.json() as { body?: string; content?: string };
+      const commentMatch = path.match(/\/issues\/(\d+)\/comments$/);
+      const issueReactionMatch = path.match(/\/issues\/(\d+)\/reactions$/);
+      const commentReactionMatch = path.match(/\/issues\/comments\/(\d+)\/reactions$/);
+
+      if (commentMatch) {
+        githubComments.push({
+          path,
+          issueNumber: Number(commentMatch[1]),
+          body: body.body || "",
+        });
+        return Response.json({ id: githubComments.length }, { status: 201 });
+      }
+
+      if (issueReactionMatch || commentReactionMatch) {
+        githubReactions.push({
+          path,
+          content: body.content || "",
+        });
+        return Response.json({ id: githubReactions.length }, { status: 201 });
+      }
+
+      return new Response(`Unexpected GitHub API path: ${path}`, { status: 404 });
     },
   });
 
@@ -286,7 +309,7 @@ async function startBridge(overrides: Partial<TestConfig>): Promise<StartedProce
     throw new Error(`Bridge failed to start.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}\n${String(err)}`);
   }
 
-  return { config, configPath, githubComments, workdir, stop };
+  return { config, configPath, githubComments, githubReactions, workdir, stop };
 }
 
 async function sendWebhook(

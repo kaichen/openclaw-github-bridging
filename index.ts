@@ -11,7 +11,7 @@
  *   bun run index.ts ./config.json
  *
  * Environment variables:
- *   GITHUB_TOKEN            - GitHub PAT with `repo` scope (for comment writeback)
+ *   GITHUB_TOKEN            - GitHub PAT with `repo` scope (for comment/reaction writeback)
  *   GITHUB_WEBHOOK_SECRET   - Shared secret configured in GitHub org webhook
   *   BRIDGE_PORT             - (optional) HTTP port, default 3847
  *   BRIDGE_DB_PATH          - (optional) SQLite file path, default ./data/bridge.sqlite
@@ -356,10 +356,6 @@ interface Task {
   finished_at: string | null;
 }
 
-interface AckContext {
-  commentExcerpt: string | null;
-}
-
 interface TaskExecutionSuccess {
   kind: "completed";
   exitCode: number;
@@ -488,43 +484,11 @@ function enqueue(db: Database, event: WebhookEvent): { status: "enqueued" | "dup
   return { status: "enqueued", taskId };
 }
 
-function getQueuePosition(db: Database, taskId: number): number {
-  const row = db.prepare(`SELECT COUNT(*) + 1 as pos FROM tasks WHERE status = 'queued' AND id < ?`)
-    .get(taskId) as { pos: number };
-  return row.pos;
-}
-
-function buildCommentExcerpt(text: string | null | undefined): string | null {
-  if (!text) return null;
-
-  const excerpt = text
-    .split("\n")
-    .map(line => line.trimEnd())
-    .filter(line => line.trim().length > 0)
-    .slice(0, 3)
-    .map(line => line.slice(0, 120))
-    .join("\n");
-
-  return excerpt || null;
-}
-
-function extractAckContext(event: WebhookEvent, payload: any): AckContext {
-  if (event.triggerType !== "mention") {
-    return { commentExcerpt: null };
-  }
-
-  return {
-    commentExcerpt: buildCommentExcerpt(payload.comment?.body),
-  };
-}
-
 // ─────────────────────────────────────────────
 // GitHub Writer
 // ─────────────────────────────────────────────
 
-async function githubComment(repoFull: string, issueNumber: number, body: string): Promise<void> {
-  const baseUrl = config.githubApiBaseUrl.replace(/\/+$/, "");
-  const url = `${baseUrl}/repos/${repoFull}/issues/${issueNumber}/comments`;
+async function githubJsonRequest(url: string, body: Record<string, unknown>, actionLabel: string): Promise<void> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const resp = await fetch(url, {
@@ -535,31 +499,37 @@ async function githubComment(repoFull: string, issueNumber: number, body: string
           "Content-Type": "application/json",
           "X-GitHub-Api-Version": "2022-11-28",
         },
-        body: JSON.stringify({ body }),
+        body: JSON.stringify(body),
       });
       if (resp.ok) return;
       const text = await resp.text();
-      log("warn", `GitHub comment attempt ${attempt + 1} failed: ${resp.status} ${text}`);
+      log("warn", `${actionLabel} attempt ${attempt + 1} failed: ${resp.status} ${text}`);
     } catch (err: any) {
-      log("warn", `GitHub comment attempt ${attempt + 1} error: ${err.message}`);
+      log("warn", `${actionLabel} attempt ${attempt + 1} error: ${err.message}`);
     }
     // Exponential backoff: 1s, 2s, 4s
     if (attempt < 2) await Bun.sleep(1000 * Math.pow(2, attempt));
   }
-  log("error", `Failed to write GitHub comment after 3 attempts: ${repoFull}#${issueNumber}`);
+  log("error", `${actionLabel} failed after 3 attempts`);
 }
 
-async function writeAck(task: Task, queuePos: number, ack: AckContext): Promise<void> {
-  const body = [
-    `🤖 Task received. Queued at position #${queuePos}.`,
-    `Trigger: ${task.trigger_type} by @${task.triggered_by}`,
-  ];
+async function githubComment(repoFull: string, issueNumber: number, body: string): Promise<void> {
+  const baseUrl = config.githubApiBaseUrl.replace(/\/+$/, "");
+  const url = `${baseUrl}/repos/${repoFull}/issues/${issueNumber}/comments`;
+  await githubJsonRequest(url, { body }, `GitHub comment for ${repoFull}#${issueNumber}`);
+}
 
-  if (ack.commentExcerpt) {
-    body.push("", "Context:", `> ${ack.commentExcerpt.replace(/\n/g, "\n> ")}`);
+function buildReceivedReactionUrl(task: Task): string {
+  const baseUrl = config.githubApiBaseUrl.replace(/\/+$/, "");
+  if (task.trigger_type === "mention" && task.comment_id !== null) {
+    return `${baseUrl}/repos/${task.repo_full}/issues/comments/${task.comment_id}/reactions`;
   }
+  return `${baseUrl}/repos/${task.repo_full}/issues/${task.resource_number}/reactions`;
+}
 
-  await githubComment(task.repo_full, task.resource_number, body.join("\n"));
+async function writeReceivedMarker(task: Task): Promise<void> {
+  const url = buildReceivedReactionUrl(task);
+  await githubJsonRequest(url, { content: "eyes" }, `GitHub reaction for task #${task.id}`);
 }
 
 async function writeStarted(task: Task): Promise<void> {
@@ -1063,8 +1033,6 @@ async function handleWebhook(req: Request, db: Database): Promise<Response> {
     return new Response("OK (filtered)", { status: 200 });
   }
 
-  const ack = extractAckContext(event, payload);
-
   // Enqueue
   const result = enqueue(db, event);
   if (result.status === "duplicate") {
@@ -1074,11 +1042,10 @@ async function handleWebhook(req: Request, db: Database): Promise<Response> {
 
   log("info", `Enqueued task #${result.taskId}: ${event.repoFull}#${event.resourceNumber} (${event.resourceType}, ${event.triggerType}) by ${event.triggeredBy}`);
 
-  // Async ack — don't block webhook response
+  // Async received marker — don't block webhook response
   const taskId = result.taskId!;
   const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as Task;
-  const pos = getQueuePosition(db, taskId);
-  writeAck(task, pos, ack).catch(err => log("error", `Failed to write ack: ${err.message}`));
+  writeReceivedMarker(task).catch(err => log("error", `Failed to write received marker: ${err.message}`));
 
   return new Response("Accepted", { status: 202 });
 }
