@@ -6,7 +6,7 @@
  * Runtime: Bun (bun:sqlite, Bun.serve, Bun.spawn, native crypto, native fetch)
  *
  * Usage:
- *   GITHUB_TOKEN=ghp_xxx GITHUB_WEBHOOK_SECRET=xxx bun run index.ts
+ *   GITHUB_TOKEN=ghp_xxx GITHUB_WEBHOOK_SECRET=example-secret bun run index.ts
  *   bun run index.ts --config ./config.json
  *   bun run index.ts ./config.json
  *
@@ -19,7 +19,7 @@
  *   BRIDGE_ENABLE_STATUS_PAGE - (optional) Enable dashboard and /api/tasks, default false
  *   BRIDGE_MAX_BODY_BYTES   - (optional) Max webhook payload bytes, default 1048576
  *   GITHUB_API_BASE_URL     - (optional) GitHub API base URL, default https://api.github.com
- *   BOT_USERNAME            - (optional) GitHub bot username, default R2D2-im
+ *   BOT_USERNAME            - (optional) GitHub bot username, default github-bot
  *   OPENCLAW_BIN            - (optional) openclaw binary path, default openclaw
  *   OPENCLAW_AGENT_ID       - (optional) agent name, default swe
   *   OPENCLAW_HOME           - (optional) HOME for openclaw process, default current HOME
@@ -110,7 +110,7 @@ function loadConfig(argv: string[], env: NodeJS.ProcessEnv): AppConfig {
     githubApiBaseUrl: readStringConfig("githubApiBaseUrl", fileConfig.githubApiBaseUrl, env.GITHUB_API_BASE_URL, "https://api.github.com"),
     githubToken: readStringConfig("githubToken", fileConfig.githubToken, env.GITHUB_TOKEN, ""),
     githubWebhookSecret: readStringConfig("githubWebhookSecret", fileConfig.githubWebhookSecret, env.GITHUB_WEBHOOK_SECRET, ""),
-    botUsername: readStringConfig("botUsername", fileConfig.botUsername, env.BOT_USERNAME, "R2D2-im"),
+    botUsername: readStringConfig("botUsername", fileConfig.botUsername, env.BOT_USERNAME, "github-bot"),
     openclawBin: readStringConfig("openclawBin", fileConfig.openclawBin, env.OPENCLAW_BIN, "openclaw"),
     openclawAgentId: readStringConfig("openclawAgentId", fileConfig.openclawAgentId, env.OPENCLAW_AGENT_ID, "swe"),
     openclawHome: readStringConfig("openclawHome", fileConfig.openclawHome, env.OPENCLAW_HOME ?? env.HOME, ""),
