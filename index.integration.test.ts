@@ -11,6 +11,7 @@ interface TestConfig {
   port: number;
   dbPath: string;
   webhookPath: string;
+  enableStatusPage: boolean;
   maxBodyBytes: number;
   githubApiBaseUrl: string;
   githubToken: string;
@@ -55,6 +56,7 @@ describe("bridge integration", () => {
     const bridge = await startBridge({
       openclawBin: "/usr/bin/true",
       pollIntervalMs: 250,
+      enableStatusPage: true,
     });
 
     const payload = {
@@ -91,6 +93,7 @@ describe("bridge integration", () => {
     const bridge = await startBridge({
       openclawBin: "/usr/bin/false",
       pollIntervalMs: 250,
+      enableStatusPage: true,
     });
 
     const payload = {
@@ -121,6 +124,7 @@ describe("bridge integration", () => {
     const bridge = await startBridge({
       openclawBin: "/usr/bin/true",
       pollIntervalMs: 5000,
+      enableStatusPage: true,
     });
 
     const payloadA = {
@@ -162,6 +166,7 @@ describe("bridge integration", () => {
     const bridge = await startBridge({
       openclawBin: "/usr/bin/true",
       pollIntervalMs: 250,
+      enableStatusPage: true,
     });
 
     const payload = {
@@ -179,6 +184,23 @@ describe("bridge integration", () => {
     const tasks = await getTasks(bridge.config.port);
     expect(tasks.find(taskItem => taskItem.resource_number === 104)).toBeUndefined();
     expect(bridge.githubComments).toHaveLength(0);
+  });
+
+  test("disables status page and tasks api by default", async () => {
+    const bridge = await startBridge({
+      openclawBin: "/usr/bin/true",
+      pollIntervalMs: 250,
+    });
+
+    const [rootResponse, tasksResponse, healthResponse] = await Promise.all([
+      fetch(`http://127.0.0.1:${bridge.config.port}/`),
+      fetch(`http://127.0.0.1:${bridge.config.port}/api/tasks`),
+      fetch(`http://127.0.0.1:${bridge.config.port}/health`),
+    ]);
+
+    expect(rootResponse.status).toBe(404);
+    expect(tasksResponse.status).toBe(404);
+    expect(healthResponse.status).toBe(200);
   });
 });
 
@@ -205,6 +227,7 @@ async function startBridge(overrides: Partial<TestConfig>): Promise<StartedProce
     port: bridgePort,
     dbPath: join(workdir, "bridge.sqlite"),
     webhookPath: "/hooks",
+    enableStatusPage: false,
     maxBodyBytes: 1_048_576,
     githubApiBaseUrl: `http://127.0.0.1:${githubPort}`,
     githubToken: "test-token",

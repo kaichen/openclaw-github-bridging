@@ -16,6 +16,7 @@
   *   BRIDGE_PORT             - (optional) HTTP port, default 3847
  *   BRIDGE_DB_PATH          - (optional) SQLite file path, default ./data/bridge.sqlite
  *   BRIDGE_WEBHOOK_PATH     - (optional) Webhook endpoint path, default /hooks
+ *   BRIDGE_ENABLE_STATUS_PAGE - (optional) Enable dashboard and /api/tasks, default false
  *   BRIDGE_MAX_BODY_BYTES   - (optional) Max webhook payload bytes, default 1048576
  *   GITHUB_API_BASE_URL     - (optional) GitHub API base URL, default https://api.github.com
  *   BOT_USERNAME            - (optional) GitHub bot username, default R2D2-im
@@ -41,6 +42,7 @@ interface FileConfig {
   port?: number;
   dbPath?: string;
   webhookPath?: string;
+  enableStatusPage?: boolean;
   maxBodyBytes?: number;
   githubApiBaseUrl?: string;
   githubToken?: string;
@@ -59,6 +61,7 @@ interface AppConfig {
   port: number;
   dbPath: string;
   webhookPath: string;
+  enableStatusPage: boolean;
   maxBodyBytes: number;
   githubApiBaseUrl: string;
   githubToken: string;
@@ -78,6 +81,7 @@ const FILE_CONFIG_KEYS = new Set<keyof FileConfig>([
   "port",
   "dbPath",
   "webhookPath",
+  "enableStatusPage",
   "maxBodyBytes",
   "githubApiBaseUrl",
   "githubToken",
@@ -101,6 +105,7 @@ function loadConfig(argv: string[], env: NodeJS.ProcessEnv): AppConfig {
     port: readNumberConfig("port", fileConfig.port, env.BRIDGE_PORT, 3847),
     dbPath: readStringConfig("dbPath", fileConfig.dbPath, env.BRIDGE_DB_PATH, "./data/bridge.sqlite"),
     webhookPath: readStringConfig("webhookPath", fileConfig.webhookPath, env.BRIDGE_WEBHOOK_PATH, "/hooks"),
+    enableStatusPage: readBooleanConfig("enableStatusPage", fileConfig.enableStatusPage, env.BRIDGE_ENABLE_STATUS_PAGE, false),
     maxBodyBytes: readNumberConfig("maxBodyBytes", fileConfig.maxBodyBytes, env.BRIDGE_MAX_BODY_BYTES, 1_048_576),
     githubApiBaseUrl: readStringConfig("githubApiBaseUrl", fileConfig.githubApiBaseUrl, env.GITHUB_API_BASE_URL, "https://api.github.com"),
     githubToken: readStringConfig("githubToken", fileConfig.githubToken, env.GITHUB_TOKEN, ""),
@@ -217,6 +222,28 @@ function readNumberConfig(
       throw new Error(`Environment variable for "${name}" must be a finite number`);
     }
     return parsed;
+  }
+
+  return defaultValue;
+}
+
+function readBooleanConfig(
+  name: string,
+  fileValue: unknown,
+  envValue: string | undefined,
+  defaultValue: boolean,
+): boolean {
+  if (fileValue !== undefined) {
+    if (typeof fileValue !== "boolean") {
+      throw new Error(`Config field "${name}" must be a boolean`);
+    }
+    return fileValue;
+  }
+
+  if (envValue !== undefined) {
+    if (envValue === "true") return true;
+    if (envValue === "false") return false;
+    throw new Error(`Environment variable for "${name}" must be "true" or "false"`);
   }
 
   return defaultValue;
@@ -927,14 +954,14 @@ function startServer(db: Database): void {
       const path = url.pathname;
 
       // ── Dashboard ──
-      if (req.method === "GET" && path === "/") {
+      if (config.enableStatusPage && req.method === "GET" && path === "/") {
         return new Response(DASHBOARD_HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });
       }
 
       // ── Tasks API ──
-      if (req.method === "GET" && path === "/api/tasks") {
+      if (config.enableStatusPage && req.method === "GET" && path === "/api/tasks") {
         const limit = parseInt(url.searchParams.get("limit") || "100", 10);
         const tasks = db.prepare(
           `SELECT
@@ -971,7 +998,11 @@ function startServer(db: Database): void {
 
   log("info", `Bridge server listening on http://localhost:${config.port}`);
   log("info", `Webhook endpoint: ${config.webhookPath}`);
-  log("info", `Dashboard: http://localhost:${config.port}/`);
+  if (config.enableStatusPage) {
+    log("info", `Dashboard: http://localhost:${config.port}/`);
+  } else {
+    log("info", "Dashboard: disabled");
+  }
 }
 
 async function handleWebhook(req: Request, db: Database): Promise<Response> {

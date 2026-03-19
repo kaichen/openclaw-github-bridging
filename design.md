@@ -391,6 +391,7 @@ This issue has been released from the queue. Re-assign or @mention to retry.
 
 静态 HTML 文件，Bridge 提供 `GET /` 返回 HTML，`GET /api/tasks` 返回 JSON。
 页面 JS 每 10 秒 fetch 刷新。每条任务可展开查看 stdout；`/api/tasks` 直接返回 `skip_reason` 和 `exit_code`，避免前端自行推断。
+出于安全考虑，status page 默认**不提供服务**；只有显式开启 `enableStatusPage` 后，`GET /` 与 `GET /api/tasks` 才会返回内容。
 
 ## Cloudflare Tunnel 配置
 
@@ -507,6 +508,7 @@ Bridge 支持两种配置来源：
   "port": 3847,
   "dbPath": "./data/bridge.sqlite",
   "webhookPath": "/hooks",
+  "enableStatusPage": false,
   "maxBodyBytes": 1048576,
   "githubApiBaseUrl": "https://api.github.com",
   "githubToken": "__REPLACE__",
@@ -522,7 +524,7 @@ Bridge 支持两种配置来源：
 }
 ```
 
-JSON 文件里的字段与运行时配置一一对应，可完整替代环境变量配置。`githubApiBaseUrl` 默认指向 `https://api.github.com`，主要用于测试或代理场景。
+JSON 文件里的字段与运行时配置一一对应，可完整替代环境变量配置。`githubApiBaseUrl` 默认指向 `https://api.github.com`，主要用于测试或代理场景。`enableStatusPage` 默认 `false`，对应的环境变量是 `BRIDGE_ENABLE_STATUS_PAGE=true|false`。
 
 ## 当前文件结构
 
@@ -603,7 +605,7 @@ secret 泄露会使签名验证失效。管理要求：
 
 ### Dashboard 访问控制
 
-监控 dashboard（`GET /` 和 `GET /api/tasks`）不应暴露到公网。两种处理方式：
+监控 dashboard（`GET /` 和 `GET /api/tasks`）默认不提供服务。需要查看状态时，先在 Bridge 配置中显式开启 `enableStatusPage`。开启后仍不应暴露到公网。两种处理方式：
 
 - **方案 A（推荐）：** Cloudflare Tunnel ingress 只路由 webhook 路径到 Bridge，dashboard 路径不配置路由。dashboard 只能通过 Tailscale 内网访问 `http://localhost:3847`。
 - **方案 B：** dashboard 路径也通过 Tunnel 暴露，但在 Cloudflare Access 上加认证（如 email OTP 或 GitHub OAuth）。
