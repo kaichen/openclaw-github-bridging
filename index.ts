@@ -7,53 +7,243 @@
  *
  * Usage:
  *   GITHUB_TOKEN=ghp_xxx GITHUB_WEBHOOK_SECRET=xxx bun run index.ts
+ *   bun run index.ts --config ./config.json
+ *   bun run index.ts ./config.json
  *
  * Environment variables:
  *   GITHUB_TOKEN            - GitHub PAT with `repo` scope (for comment writeback)
  *   GITHUB_WEBHOOK_SECRET   - Shared secret configured in GitHub org webhook
- *   BRIDGE_PORT             - (optional) HTTP port, default 3847
+  *   BRIDGE_PORT             - (optional) HTTP port, default 3847
  *   BRIDGE_DB_PATH          - (optional) SQLite file path, default ./data/bridge.sqlite
+ *   BRIDGE_WEBHOOK_PATH     - (optional) Webhook endpoint path, default /hooks
+ *   BRIDGE_MAX_BODY_BYTES   - (optional) Max webhook payload bytes, default 1048576
+ *   GITHUB_API_BASE_URL     - (optional) GitHub API base URL, default https://api.github.com
  *   BOT_USERNAME            - (optional) GitHub bot username, default R2D2-im
  *   OPENCLAW_BIN            - (optional) openclaw binary path, default openclaw
  *   OPENCLAW_AGENT_ID       - (optional) agent name, default swe
- *   OPENCLAW_HOME           - (optional) HOME for openclaw process, default current HOME
- *   TASK_TIMEOUT_MS         - (optional) task timeout in ms, default 1800000 (30min)
+  *   OPENCLAW_HOME           - (optional) HOME for openclaw process, default current HOME
+  *   TASK_TIMEOUT_MS         - (optional) task timeout in ms, default 1800000 (30min)
+ *   GRACEFUL_KILL_MS        - (optional) grace period after SIGTERM, default 5000
  *   POLL_INTERVAL_MS        - (optional) scheduler poll interval, default 5000
+ *   MAX_STDOUT_BYTES        - (optional) stdout bytes stored per task, default 102400
  */
 
 import { Database } from "bun:sqlite";
 import { createHmac, timingSafeEqual } from "crypto";
-import { mkdirSync, existsSync } from "fs";
-import { dirname } from "path";
+import { mkdirSync, existsSync, readFileSync } from "fs";
+import { dirname, resolve } from "path";
 
 // ─────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────
 
-const config = {
-  port: parseInt(process.env.BRIDGE_PORT || "3847", 10),
-  dbPath: process.env.BRIDGE_DB_PATH || "./data/bridge.sqlite",
-  webhookPath: "/hooks",
-  maxBodyBytes: 1_048_576, // 1 MB
+interface FileConfig {
+  port?: number;
+  dbPath?: string;
+  webhookPath?: string;
+  maxBodyBytes?: number;
+  githubApiBaseUrl?: string;
+  githubToken?: string;
+  githubWebhookSecret?: string;
+  botUsername?: string;
+  openclawBin?: string;
+  openclawAgentId?: string;
+  openclawHome?: string;
+  taskTimeoutMs?: number;
+  gracefulKillMs?: number;
+  pollIntervalMs?: number;
+  maxStdoutBytes?: number;
+}
 
-  githubToken: process.env.GITHUB_TOKEN || "",
-  githubWebhookSecret: process.env.GITHUB_WEBHOOK_SECRET || "",
-  botUsername: process.env.BOT_USERNAME || "R2D2-im",
+interface AppConfig {
+  port: number;
+  dbPath: string;
+  webhookPath: string;
+  maxBodyBytes: number;
+  githubApiBaseUrl: string;
+  githubToken: string;
+  githubWebhookSecret: string;
+  botUsername: string;
+  openclawBin: string;
+  openclawAgentId: string;
+  openclawHome: string;
+  taskTimeoutMs: number;
+  gracefulKillMs: number;
+  pollIntervalMs: number;
+  maxStdoutBytes: number;
+  configSource: string;
+}
 
-  openclawBin: process.env.OPENCLAW_BIN || "openclaw",
-  openclawAgentId: process.env.OPENCLAW_AGENT_ID || "swe",
-  openclawHome: process.env.OPENCLAW_HOME || process.env.HOME || "",
+const FILE_CONFIG_KEYS = new Set<keyof FileConfig>([
+  "port",
+  "dbPath",
+  "webhookPath",
+  "maxBodyBytes",
+  "githubApiBaseUrl",
+  "githubToken",
+  "githubWebhookSecret",
+  "botUsername",
+  "openclawBin",
+  "openclawAgentId",
+  "openclawHome",
+  "taskTimeoutMs",
+  "gracefulKillMs",
+  "pollIntervalMs",
+  "maxStdoutBytes",
+]);
 
-  taskTimeoutMs: parseInt(process.env.TASK_TIMEOUT_MS || "1800000", 10),
-  gracefulKillMs: 5_000,
-  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "5000", 10),
+const config = loadConfig(Bun.argv, process.env);
 
-  maxStdoutBytes: 102_400, // 100 KB stored in DB
-};
+function loadConfig(argv: string[], env: NodeJS.ProcessEnv): AppConfig {
+  const cli = parseCliArgs(argv.slice(2));
+  const fileConfig = cli.configPath ? readConfigFile(cli.configPath) : {};
+  const appConfig: AppConfig = {
+    port: readNumberConfig("port", fileConfig.port, env.BRIDGE_PORT, 3847),
+    dbPath: readStringConfig("dbPath", fileConfig.dbPath, env.BRIDGE_DB_PATH, "./data/bridge.sqlite"),
+    webhookPath: readStringConfig("webhookPath", fileConfig.webhookPath, env.BRIDGE_WEBHOOK_PATH, "/hooks"),
+    maxBodyBytes: readNumberConfig("maxBodyBytes", fileConfig.maxBodyBytes, env.BRIDGE_MAX_BODY_BYTES, 1_048_576),
+    githubApiBaseUrl: readStringConfig("githubApiBaseUrl", fileConfig.githubApiBaseUrl, env.GITHUB_API_BASE_URL, "https://api.github.com"),
+    githubToken: readStringConfig("githubToken", fileConfig.githubToken, env.GITHUB_TOKEN, ""),
+    githubWebhookSecret: readStringConfig("githubWebhookSecret", fileConfig.githubWebhookSecret, env.GITHUB_WEBHOOK_SECRET, ""),
+    botUsername: readStringConfig("botUsername", fileConfig.botUsername, env.BOT_USERNAME, "R2D2-im"),
+    openclawBin: readStringConfig("openclawBin", fileConfig.openclawBin, env.OPENCLAW_BIN, "openclaw"),
+    openclawAgentId: readStringConfig("openclawAgentId", fileConfig.openclawAgentId, env.OPENCLAW_AGENT_ID, "swe"),
+    openclawHome: readStringConfig("openclawHome", fileConfig.openclawHome, env.OPENCLAW_HOME ?? env.HOME, ""),
+    taskTimeoutMs: readNumberConfig("taskTimeoutMs", fileConfig.taskTimeoutMs, env.TASK_TIMEOUT_MS, 1_800_000),
+    gracefulKillMs: readNumberConfig("gracefulKillMs", fileConfig.gracefulKillMs, env.GRACEFUL_KILL_MS, 5_000),
+    pollIntervalMs: readNumberConfig("pollIntervalMs", fileConfig.pollIntervalMs, env.POLL_INTERVAL_MS, 5_000),
+    maxStdoutBytes: readNumberConfig("maxStdoutBytes", fileConfig.maxStdoutBytes, env.MAX_STDOUT_BYTES, 102_400),
+    configSource: cli.configPath ? `json:${resolve(cli.configPath)}` : "env",
+  };
 
-function validateConfig() {
-  if (!config.githubToken) throw new Error("GITHUB_TOKEN is required");
-  if (!config.githubWebhookSecret) throw new Error("GITHUB_WEBHOOK_SECRET is required");
+  validateConfig(appConfig);
+  return appConfig;
+}
+
+function parseCliArgs(args: string[]): { configPath: string | null } {
+  let configPath: string | null = null;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === undefined) continue;
+
+    if (arg === "--config") {
+      const next = args[index + 1];
+      if (!next) throw new Error("--config requires a path");
+      if (configPath) throw new Error("config path specified more than once");
+      configPath = next;
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--config=")) {
+      if (configPath) throw new Error("config path specified more than once");
+      const inlinePath = arg.slice("--config=".length);
+      if (!inlinePath) throw new Error("--config requires a path");
+      configPath = inlinePath;
+      continue;
+    }
+
+    if (arg.startsWith("--")) {
+      throw new Error(`Unknown argument: ${arg}`);
+    }
+
+    if (configPath) {
+      throw new Error(`Unexpected extra argument: ${arg}`);
+    }
+
+    configPath = arg;
+  }
+
+  return { configPath };
+}
+
+function readConfigFile(path: string): FileConfig {
+  const resolvedPath = resolve(path);
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(readFileSync(resolvedPath, "utf-8"));
+  } catch (err: any) {
+    throw new Error(`Failed to read config file ${resolvedPath}: ${err.message}`);
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Config file ${resolvedPath} must contain a JSON object`);
+  }
+
+  for (const key of Object.keys(parsed)) {
+    if (!FILE_CONFIG_KEYS.has(key as keyof FileConfig)) {
+      throw new Error(`Unsupported config key in ${resolvedPath}: ${key}`);
+    }
+  }
+
+  return parsed as FileConfig;
+}
+
+function readStringConfig(
+  name: string,
+  fileValue: unknown,
+  envValue: string | undefined,
+  defaultValue: string,
+): string {
+  if (fileValue !== undefined) {
+    if (typeof fileValue !== "string") {
+      throw new Error(`Config field "${name}" must be a string`);
+    }
+    return fileValue;
+  }
+
+  if (envValue !== undefined) return envValue;
+  return defaultValue;
+}
+
+function readNumberConfig(
+  name: string,
+  fileValue: unknown,
+  envValue: string | undefined,
+  defaultValue: number,
+): number {
+  if (fileValue !== undefined) {
+    if (typeof fileValue !== "number" || !Number.isFinite(fileValue)) {
+      throw new Error(`Config field "${name}" must be a finite number`);
+    }
+    return fileValue;
+  }
+
+  if (envValue !== undefined) {
+    const parsed = Number(envValue);
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`Environment variable for "${name}" must be a finite number`);
+    }
+    return parsed;
+  }
+
+  return defaultValue;
+}
+
+function validateConfig(config: AppConfig) {
+  if (!config.githubToken) throw new Error("githubToken/GITHUB_TOKEN is required");
+  if (!config.githubWebhookSecret) throw new Error("githubWebhookSecret/GITHUB_WEBHOOK_SECRET is required");
+  if (!/^https?:\/\//.test(config.githubApiBaseUrl)) {
+    throw new Error("githubApiBaseUrl must start with http:// or https://");
+  }
+  if (!config.webhookPath.startsWith("/")) throw new Error('webhookPath must start with "/"');
+  if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) {
+    throw new Error("port must be an integer between 1 and 65535");
+  }
+
+  for (const [name, value] of [
+    ["maxBodyBytes", config.maxBodyBytes],
+    ["taskTimeoutMs", config.taskTimeoutMs],
+    ["gracefulKillMs", config.gracefulKillMs],
+    ["pollIntervalMs", config.pollIntervalMs],
+    ["maxStdoutBytes", config.maxStdoutBytes],
+  ] as const) {
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new Error(`${name} must be a positive integer`);
+    }
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -306,7 +496,8 @@ function extractAckContext(event: WebhookEvent, payload: any): AckContext {
 // ─────────────────────────────────────────────
 
 async function githubComment(repoFull: string, issueNumber: number, body: string): Promise<void> {
-  const url = `https://api.github.com/repos/${repoFull}/issues/${issueNumber}/comments`;
+  const baseUrl = config.githubApiBaseUrl.replace(/\/+$/, "");
+  const url = `${baseUrl}/repos/${repoFull}/issues/${issueNumber}/comments`;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const resp = await fetch(url, {
@@ -866,10 +1057,10 @@ async function handleWebhook(req: Request, db: Database): Promise<Response> {
 // ─────────────────────────────────────────────
 
 function main() {
-  validateConfig();
   const db = initDb();
 
   log("info", "GitHub ↔ OpenClaw Bridge starting...");
+  log("info", `Config source: ${config.configSource}`);
   log("info", `Bot username: ${config.botUsername}`);
   log("info", `OpenClaw agent: ${config.openclawAgentId}`);
   log("info", `Task timeout: ${config.taskTimeoutMs / 60000} minutes`);
